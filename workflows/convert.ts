@@ -1,5 +1,9 @@
 import { Sandbox } from '@vercel/sandbox';
-import { createWebhook, sleep } from 'workflow';
+import { createWebhook, FatalError, sleep } from 'workflow';
+
+// Static ffmpeg build — no apt-get needed in the Sandbox.
+const FFMPEG_URL =
+  'https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz';
 
 /**
  * Converts a media file using ffmpeg inside a Vercel Sandbox.
@@ -34,31 +38,57 @@ export async function convertMedia(
     using webhook = createWebhook();
     const callbackUrl = new URL(webhook.url, baseUrl).href;
 
-    // Build the conversion script. When ffmpeg completes, it
-    // collects metadata with ffprobe and POSTs it to the webhook.
+    // Build the conversion script. The script ALWAYS calls the
+    // webhook — on success it sends metadata, on failure it sends
+    // the error. This ensures the workflow never hangs.
     const script = `#!/bin/bash
-set -euo pipefail
 
-# Install ffmpeg
-apt-get update -qq > /dev/null 2>&1
-apt-get install -y -qq ffmpeg > /dev/null 2>&1
+CALLBACK_URL='${callbackUrl}'
 
-# Download the input file
-curl -sfL -o /tmp/input '${inputUrl}'
+# Error handler — POST the error to the webhook so the workflow resumes
+report_error() {
+  local msg="$1"
+  echo "ERROR: $msg" >&2
+  curl -sf -X POST "$CALLBACK_URL" \\
+    -H 'Content-Type: application/json' \\
+    -d "{\\"error\\": \\"$msg\\"}" || true
+  exit 1
+}
 
-# Collect input file metadata
-INPUT_META=$(ffprobe -v error -show_entries format=duration,size,format_name -of json /tmp/input)
+echo "==> Downloading static ffmpeg build..."
+curl -sfL '${FFMPEG_URL}' -o /tmp/ffmpeg.tar.xz \\
+  || report_error "Failed to download ffmpeg"
 
-# Convert with ffmpeg
-ffmpeg -i /tmp/input -y '/tmp/output.${outputFormat}' 2>/dev/null
+echo "==> Extracting ffmpeg..."
+mkdir -p /tmp/ffmpeg-bin
+tar xf /tmp/ffmpeg.tar.xz --strip-components=1 -C /tmp/ffmpeg-bin \\
+  || report_error "Failed to extract ffmpeg"
 
-# Collect output file metadata
-OUTPUT_META=$(ffprobe -v error -show_entries format=duration,size,format_name -of json '/tmp/output.${outputFormat}')
+export PATH="/tmp/ffmpeg-bin:$PATH"
 
-# Resume the workflow by POSTing metadata to the webhook
-curl -sf -X POST '${callbackUrl}' \\
+echo "==> Downloading input file..."
+curl -sfL -o /tmp/input '${inputUrl}' \\
+  || report_error "Failed to download input file"
+
+echo "==> Collecting input metadata..."
+INPUT_META=$(ffprobe -v error -show_entries format=duration,size,format_name -of json /tmp/input 2>&1) \\
+  || report_error "ffprobe failed on input: $INPUT_META"
+
+echo "==> Converting to ${outputFormat}..."
+FFMPEG_OUTPUT=$(ffmpeg -i /tmp/input -y '/tmp/output.${outputFormat}' 2>&1) \\
+  || report_error "ffmpeg conversion failed: $FFMPEG_OUTPUT"
+
+echo "==> Collecting output metadata..."
+OUTPUT_META=$(ffprobe -v error -show_entries format=duration,size,format_name -of json '/tmp/output.${outputFormat}' 2>&1) \\
+  || report_error "ffprobe failed on output: $OUTPUT_META"
+
+echo "==> Conversion complete, resuming workflow..."
+curl -sf -X POST "$CALLBACK_URL" \\
   -H 'Content-Type: application/json' \\
-  -d "{\\"input\\": $INPUT_META, \\"output\\": $OUTPUT_META}"
+  -d "{\\"input\\": $INPUT_META, \\"output\\": $OUTPUT_META}" \\
+  || report_error "Failed to POST to webhook"
+
+echo "==> Done."
 `;
 
     // Write the script to the Sandbox filesystem
@@ -74,12 +104,17 @@ curl -sf -X POST '${callbackUrl}' \\
     const result = await Promise.race([webhook, sleep('5m')]);
 
     if (!result) {
-      throw new Error('Conversion timed out after 5 minutes');
+      throw new FatalError('Conversion timed out after 5 minutes');
     }
 
     // Parse the metadata that the script POSTed to the webhook.
     // Request#json() executes as a step in the workflow context.
     const metadata = await result.json();
+
+    // If the script reported an error, surface it
+    if (metadata.error) {
+      throw new FatalError(`Sandbox script failed: ${metadata.error}`);
+    }
 
     return {
       outputFormat,

@@ -27,13 +27,16 @@ export async function GET(request: Request) {
   const run = getRun(runId);
   const status = await run.status;
 
-  if (status === 'completed') {
-    const output = await run.returnValue;
-    return Response.json({ status, output });
-  }
-
-  if (status === 'failed') {
-    return Response.json({ status, error: 'Conversion failed' });
+  if (status === 'completed' || status === 'failed') {
+    try {
+      const output = await run.returnValue;
+      return Response.json({ status: 'completed', output });
+    } catch (err) {
+      return Response.json({
+        status: 'failed',
+        error: err instanceof Error ? err.message : 'Conversion failed',
+      });
+    }
   }
 
   return Response.json({ status });
