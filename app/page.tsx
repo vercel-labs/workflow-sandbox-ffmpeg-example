@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 
 const OUTPUT_FORMATS = [
   { value: 'mp3', label: 'MP3 (audio)' },
@@ -10,6 +10,12 @@ const OUTPUT_FORMATS = [
   { value: 'webm', label: 'WebM (video)' },
   { value: 'gif', label: 'GIF (animated)' },
 ];
+
+interface LogEntry {
+  ts: number;
+  message: string;
+  level?: string;
+}
 
 interface ConversionResult {
   outputFormat: string;
@@ -33,6 +39,64 @@ export default function Home() {
     'idle'
   );
   const [error, setError] = useState('');
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const logsEndRef = useRef<HTMLDivElement>(null);
+
+  function appendLog(entry: LogEntry) {
+    setLogs((prev) => [...prev, entry]);
+    // Auto-scroll to bottom
+    setTimeout(
+      () => logsEndRef.current?.scrollIntoView({ behavior: 'smooth' }),
+      50
+    );
+  }
+
+  async function readLogStream(runId: string) {
+    try {
+      const res = await fetch(`/api/convert/stream?runId=${runId}`);
+      if (!res.ok || !res.body) return;
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // The stream sends newline-delimited JSON chunks
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const entry = JSON.parse(trimmed);
+            if (entry.message) {
+              appendLog(entry);
+            }
+          } catch {
+            // Not valid JSON — might be a partial chunk
+          }
+        }
+      }
+
+      // Process any remaining buffer
+      if (buffer.trim()) {
+        try {
+          const entry = JSON.parse(buffer.trim());
+          if (entry.message) appendLog(entry);
+        } catch {
+          // ignore
+        }
+      }
+    } catch {
+      // Stream connection failed or was closed — not critical
+    }
+  }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -41,6 +105,7 @@ export default function Home() {
     setStatus('running');
     setResult(null);
     setError('');
+    setLogs([]);
 
     try {
       const res = await fetch('/api/convert', {
@@ -56,6 +121,10 @@ export default function Home() {
 
       const { runId } = await res.json();
 
+      // Start reading the log stream (non-blocking)
+      readLogStream(runId);
+
+      // Poll for completion
       const poll = async () => {
         const pollRes = await fetch(`/api/convert?runId=${runId}`);
         const data = await pollRes.json();
@@ -138,11 +207,28 @@ export default function Home() {
           </div>
         </form>
 
-        {status === 'running' && (
-          <div className="flex items-center gap-2 text-sm text-zinc-400">
-            <div className="h-4 w-4 animate-spin rounded-full border-2 border-zinc-600 border-t-zinc-300" />
-            Converting in Sandbox... workflow is suspended, waiting for webhook
-            callback.
+        {logs.length > 0 && (
+          <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-4">
+            <h2 className="mb-2 text-xs font-medium text-zinc-500 uppercase">
+              Sandbox Logs
+            </h2>
+            <div className="max-h-64 overflow-y-auto font-mono text-xs leading-relaxed">
+              {logs.map((entry, i) => (
+                <div
+                  key={i}
+                  className={
+                    entry.level === 'stderr'
+                      ? 'text-yellow-400'
+                      : entry.message.startsWith('$')
+                        ? 'text-blue-400'
+                        : 'text-zinc-400'
+                  }
+                >
+                  {entry.message}
+                </div>
+              ))}
+              <div ref={logsEndRef} />
+            </div>
           </div>
         )}
 

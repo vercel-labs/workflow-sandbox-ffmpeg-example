@@ -1,21 +1,64 @@
 import { Sandbox } from '@vercel/sandbox';
-import { createWebhook, FatalError, sleep } from 'workflow';
+import { createWebhook, FatalError, getWritable, sleep } from 'workflow';
 
 /**
- * Runs a command in the Sandbox and throws on failure, including
- * stdout/stderr in the error message for visibility.
+ * Writes a log entry to the "logs" stream, which clients can
+ * read in real-time via getReadable({ namespace: "logs" }).
+ */
+async function log(message: string) {
+  'use step';
+  const writable = getWritable({ namespace: 'logs' });
+  const writer = writable.getWriter();
+  await writer.write({ ts: Date.now(), message });
+  writer.releaseLock();
+}
+
+/**
+ * Closes the "logs" stream. Must be called when the workflow
+ * is done writing logs so the client stream terminates.
+ */
+async function closeLogs() {
+  'use step';
+  const writable = getWritable({ namespace: 'logs' });
+  await writable.close();
+}
+
+/**
+ * Runs a command in the Sandbox, streams stdout/stderr to the
+ * logs stream, and throws on failure.
  */
 async function run(sandbox: Sandbox, cmd: string, args: string[]) {
   'use step';
+  const label = `${cmd} ${args.join(' ')}`;
+
+  // Write to the logs stream
+  const writable = getWritable({ namespace: 'logs' });
+  const writer = writable.getWriter();
+  await writer.write({ ts: Date.now(), message: `$ ${label}` });
+
   const result = await sandbox.runCommand(cmd, args);
   const stdout = await result.stdout();
   const stderr = await result.stderr();
-  console.log(`[sandbox] ${cmd} ${args.join(' ')}`);
-  if (stdout) console.log(stdout);
-  if (stderr) console.error(stderr);
+
+  if (stdout) {
+    await writer.write({
+      ts: Date.now(),
+      message: stdout.trim(),
+    });
+  }
+  if (stderr) {
+    await writer.write({
+      ts: Date.now(),
+      message: stderr.trim(),
+      level: 'stderr',
+    });
+  }
+
+  writer.releaseLock();
+
   if (result.exitCode !== 0) {
     throw new FatalError(
-      `Command failed (exit ${result.exitCode}): ${cmd} ${args.join(' ')}\n${stderr || stdout}`
+      `Command failed (exit ${result.exitCode}): ${label}\n${stderr || stdout}`
     );
   }
   return { stdout, stderr, exitCode: result.exitCode };
@@ -34,6 +77,9 @@ async function run(sandbox: Sandbox, cmd: string, args: string[]) {
  * The actual ffmpeg conversion runs as a background process — when it
  * finishes, a curl request hits the workflow's webhook URL to resume
  * execution.
+ *
+ * All sandbox output is piped to a "logs" stream that clients can read
+ * in real-time via getReadable({ namespace: "logs" }).
  */
 export async function convertMedia(
   baseUrl: string,
@@ -41,6 +87,8 @@ export async function convertMedia(
   outputFormat: string
 ) {
   'use workflow';
+
+  await log(`Starting conversion: ${inputUrl} → ${outputFormat}`);
 
   // Create a Sandbox VM — this is a durable step. The returned
   // Sandbox instance is serialized via WORKFLOW_SERIALIZE when it
@@ -52,20 +100,23 @@ export async function convertMedia(
   try {
     // Step 1: Install xz (needed to decompress the ffmpeg tarball).
     // The Sandbox is Amazon Linux 2023 with dnf + sudo available.
-    // Each runCommand() is a durable step with visible stdout/stderr.
+    await log('Installing xz...');
     await run(sandbox, 'sudo', ['dnf', 'install', '-y', 'xz']);
 
     // Step 2: Download and extract a static ffmpeg build to /tmp
     // (writable by the sandbox user — /usr/local requires root).
+    await log('Downloading ffmpeg...');
     await run(sandbox, 'bash', [
       '-c',
       "mkdir -p /tmp/ffmpeg && curl -sfL 'https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz' | tar xJf - --strip-components=1 -C /tmp/ffmpeg",
     ]);
 
     // Step 3: Download the input media file
+    await log('Downloading input file...');
     await run(sandbox, 'bash', ['-c', `curl -sfL -o /tmp/input '${inputUrl}'`]);
 
     // Step 4: Collect input file metadata (so we can return it later)
+    await log('Analyzing input with ffprobe...');
     const { stdout: inputMetaJson } = await run(sandbox, 'bash', [
       '-c',
       '/tmp/ffmpeg/ffprobe -v error -show_entries format=duration,size,format_name -of json /tmp/input',
@@ -74,6 +125,7 @@ export async function convertMedia(
     // Step 5: Create the webhook and kick off ffmpeg in the background.
     // When ffmpeg finishes, the script curls the webhook URL to resume
     // the workflow. The workflow suspends (zero compute) while it runs.
+    await log(`Converting to ${outputFormat} (suspending workflow)...`);
     const webhook = createWebhook();
     const callbackUrl = new URL(webhook.url, baseUrl).href;
 
@@ -116,6 +168,9 @@ fi
     if (metadata.error) {
       throw new FatalError(`Sandbox: ${metadata.error}`);
     }
+
+    await log('Conversion complete.');
+    await closeLogs();
 
     return {
       outputFormat,
