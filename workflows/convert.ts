@@ -6,6 +6,26 @@ const FFMPEG_URL =
   'https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz';
 
 /**
+ * Runs a command in the Sandbox and throws on failure, including
+ * stdout/stderr in the error message for visibility.
+ */
+async function run(sandbox: Sandbox, cmd: string, args: string[]) {
+  'use step';
+  const result = await sandbox.runCommand(cmd, args);
+  const stdout = await result.stdout();
+  const stderr = await result.stderr();
+  console.log(`[sandbox] ${cmd} ${args.join(' ')}`);
+  if (stdout) console.log(stdout);
+  if (stderr) console.error(stderr);
+  if (result.exitCode !== 0) {
+    throw new FatalError(
+      `Command failed (exit ${result.exitCode}): ${cmd} ${args.join(' ')}\n${stderr || stdout}`
+    );
+  }
+  return { stdout, stderr, exitCode: result.exitCode };
+}
+
+/**
  * Converts a media file using ffmpeg inside a Vercel Sandbox.
  *
  * The Sandbox instance is used directly in the "use workflow" function —
@@ -13,10 +33,11 @@ const FFMPEG_URL =
  * built in, and the Sandbox object is automatically serialized across step
  * boundaries via the WORKFLOW_SERIALIZE / WORKFLOW_DESERIALIZE protocol.
  *
- * The conversion runs as a background process inside the Sandbox. When
- * ffmpeg finishes, a curl request hits the workflow's webhook URL to
- * resume execution. The workflow is fully suspended (zero compute) while
- * the Sandbox does the work.
+ * Setup commands (downloading ffmpeg, downloading the input file) run
+ * synchronously as durable steps so we get stdout/stderr for debugging.
+ * The actual ffmpeg conversion runs as a background process — when it
+ * finishes, a curl request hits the workflow's webhook URL to resume
+ * execution.
  */
 export async function convertMedia(
   baseUrl: string,
@@ -33,71 +54,52 @@ export async function convertMedia(
   });
 
   try {
-    // Create a webhook — the Sandbox will curl this URL when
-    // ffmpeg finishes, resuming the workflow.
+    // Step 1: Download and extract static ffmpeg build.
+    // Each runCommand() is a durable step with visible stdout/stderr.
+    await run(sandbox, 'bash', [
+      '-c',
+      `curl -sfL '${FFMPEG_URL}' -o /tmp/ffmpeg.tar.xz && mkdir -p /tmp/ffmpeg-bin && tar xf /tmp/ffmpeg.tar.xz --strip-components=1 -C /tmp/ffmpeg-bin`,
+    ]);
+
+    // Step 2: Download the input media file
+    await run(sandbox, 'bash', ['-c', `curl -sfL -o /tmp/input '${inputUrl}'`]);
+
+    // Step 3: Collect input file metadata (so we can return it later)
+    const { stdout: inputMetaJson } = await run(sandbox, 'bash', [
+      '-c',
+      '/tmp/ffmpeg-bin/ffprobe -v error -show_entries format=duration,size,format_name -of json /tmp/input',
+    ]);
+
+    // Step 4: Create the webhook and kick off ffmpeg in the background.
+    // When ffmpeg finishes, the script curls the webhook URL to resume
+    // the workflow. The workflow suspends (zero compute) while it runs.
     using webhook = createWebhook();
     const callbackUrl = new URL(webhook.url, baseUrl).href;
 
-    // Build the conversion script. The script ALWAYS calls the
-    // webhook — on success it sends metadata, on failure it sends
-    // the error. This ensures the workflow never hangs.
-    const script = `#!/bin/bash
-
-CALLBACK_URL='${callbackUrl}'
-
-# Error handler — POST the error to the webhook so the workflow resumes
-report_error() {
-  local msg="$1"
-  echo "ERROR: $msg" >&2
-  curl -sf -X POST "$CALLBACK_URL" \\
-    -H 'Content-Type: application/json' \\
-    -d "{\\"error\\": \\"$msg\\"}" || true
-  exit 1
-}
-
-echo "==> Downloading static ffmpeg build..."
-curl -sfL '${FFMPEG_URL}' -o /tmp/ffmpeg.tar.xz \\
-  || report_error "Failed to download ffmpeg"
-
-echo "==> Extracting ffmpeg..."
-mkdir -p /tmp/ffmpeg-bin
-tar xf /tmp/ffmpeg.tar.xz --strip-components=1 -C /tmp/ffmpeg-bin \\
-  || report_error "Failed to extract ffmpeg"
-
+    const conversionScript = `#!/bin/bash
 export PATH="/tmp/ffmpeg-bin:$PATH"
 
-echo "==> Downloading input file..."
-curl -sfL -o /tmp/input '${inputUrl}' \\
-  || report_error "Failed to download input file"
+ffmpeg -i /tmp/input -y '/tmp/output.${outputFormat}' 2>/tmp/ffmpeg.log
 
-echo "==> Collecting input metadata..."
-INPUT_META=$(ffprobe -v error -show_entries format=duration,size,format_name -of json /tmp/input 2>&1) \\
-  || report_error "ffprobe failed on input: $INPUT_META"
-
-echo "==> Converting to ${outputFormat}..."
-FFMPEG_OUTPUT=$(ffmpeg -i /tmp/input -y '/tmp/output.${outputFormat}' 2>&1) \\
-  || report_error "ffmpeg conversion failed: $FFMPEG_OUTPUT"
-
-echo "==> Collecting output metadata..."
-OUTPUT_META=$(ffprobe -v error -show_entries format=duration,size,format_name -of json '/tmp/output.${outputFormat}' 2>&1) \\
-  || report_error "ffprobe failed on output: $OUTPUT_META"
-
-echo "==> Conversion complete, resuming workflow..."
-curl -sf -X POST "$CALLBACK_URL" \\
-  -H 'Content-Type: application/json' \\
-  -d "{\\"input\\": $INPUT_META, \\"output\\": $OUTPUT_META}" \\
-  || report_error "Failed to POST to webhook"
-
-echo "==> Done."
+if [ $? -eq 0 ]; then
+  OUTPUT_META=$(ffprobe -v error -show_entries format=duration,size,format_name -of json '/tmp/output.${outputFormat}')
+  curl -sf -X POST '${callbackUrl}' \\
+    -H 'Content-Type: application/json' \\
+    -d "{\\"output\\": $OUTPUT_META}"
+else
+  LOG=$(cat /tmp/ffmpeg.log | head -20 | tr '"' "'")
+  curl -sf -X POST '${callbackUrl}' \\
+    -H 'Content-Type: application/json' \\
+    -d "{\\"error\\": \\"ffmpeg failed: $LOG\\"}"
+fi
 `;
 
-    // Write the script to the Sandbox filesystem
-    await sandbox.writeFiles([{ path: 'convert.sh', content: script }]);
+    await sandbox.writeFiles([
+      { path: 'convert.sh', content: conversionScript },
+    ]);
 
-    // Start the conversion in the background. The outer shell
-    // starts the inner script and exits immediately, so
-    // runCommand() returns without waiting for ffmpeg to finish.
-    await sandbox.runCommand('bash', ['-c', 'bash /home/user/convert.sh &']);
+    // Start conversion in background — runCommand returns immediately
+    await run(sandbox, 'bash', ['-c', 'bash /home/user/convert.sh &']);
 
     // Workflow SUSPENDS here — zero compute while ffmpeg runs
     // in the Sandbox. Could be seconds or minutes.
@@ -111,14 +113,13 @@ echo "==> Done."
     // Request#json() executes as a step in the workflow context.
     const metadata = await result.json();
 
-    // If the script reported an error, surface it
     if (metadata.error) {
-      throw new FatalError(`Sandbox script failed: ${metadata.error}`);
+      throw new FatalError(`Sandbox: ${metadata.error}`);
     }
 
     return {
       outputFormat,
-      input: metadata.input?.format,
+      input: JSON.parse(inputMetaJson)?.format,
       output: metadata.output?.format,
     };
   } finally {
