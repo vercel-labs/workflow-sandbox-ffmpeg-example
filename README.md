@@ -5,11 +5,12 @@ A media file converter that runs ffmpeg inside a [Vercel Sandbox](https://vercel
 ## How It Works
 
 1. User provides a media file URL and selects an output format
-2. The workflow creates a **Sandbox VM** and a **webhook**
-3. A shell script is written to the Sandbox that downloads the file, runs ffmpeg, and `curl`s the webhook URL when done
-4. The script starts in the background — the workflow **suspends** (zero compute)
-5. When ffmpeg finishes, the `curl` hits the webhook, **resuming** the workflow
-6. The workflow collects conversion metadata and cleans up the Sandbox
+2. The workflow creates a **Sandbox VM** and installs ffmpeg (as durable steps with visible stdout/stderr)
+3. The input file is downloaded and its metadata collected
+4. A **webhook** is created, and a shell script runs ffmpeg in the background
+5. The workflow **suspends** — zero compute while the Sandbox does the conversion
+6. When ffmpeg finishes, it `curl`s the webhook URL, **resuming** the workflow
+7. The workflow collects the output metadata and cleans up the Sandbox
 
 ```ts
 export async function convertMedia(baseUrl: string, inputUrl: string, outputFormat: string) {
@@ -20,16 +21,23 @@ export async function convertMedia(baseUrl: string, inputUrl: string, outputForm
   const sandbox = await Sandbox.create({ timeout: 5 * 60 * 1000 });
 
   try {
+    // Setup steps run synchronously with visible stdout/stderr
+    await run(sandbox, "sudo", ["dnf", "install", "-y", "xz"]);
+    await run(sandbox, "bash", ["-c", "curl -sfL '...' | tar xJf - -C /tmp/ffmpeg"]);
+    await run(sandbox, "bash", ["-c", `curl -sfL -o /tmp/input '${inputUrl}'`]);
+
+    // Create webhook — the Sandbox will curl this URL when done
     using webhook = createWebhook();
     const callbackUrl = new URL(webhook.url, baseUrl).href;
 
-    // Write the conversion script and start it in the background
+    // Write + start the conversion script in the background
     await sandbox.writeFiles([{ path: "convert.sh", content: script }]);
-    await sandbox.runCommand("bash", ["-c", "bash /home/user/convert.sh &"]);
+    await run(sandbox, "bash", ["-c", "bash convert.sh &"]);
 
     // Workflow SUSPENDS — zero compute while ffmpeg runs in the Sandbox.
     // When the script finishes, it curls the webhook URL to resume.
     const result = await Promise.race([webhook, sleep("5m")]);
+    const metadata = await result.json();
     // ...
   } finally {
     await sandbox.stop();
