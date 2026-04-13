@@ -1,10 +1,6 @@
 import { Sandbox } from '@vercel/sandbox';
 import { createWebhook, FatalError, sleep } from 'workflow';
 
-// Static ffmpeg build — no apt-get needed in the Sandbox.
-const FFMPEG_URL =
-  'https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz';
-
 /**
  * Runs a command in the Sandbox and throws on failure, including
  * stdout/stderr in the error message for visibility.
@@ -54,12 +50,9 @@ export async function convertMedia(
   });
 
   try {
-    // Step 1: Download and extract static ffmpeg build.
+    // Step 1: Install ffmpeg via dnf (Amazon Linux 2023 package manager).
     // Each runCommand() is a durable step with visible stdout/stderr.
-    await run(sandbox, 'bash', [
-      '-c',
-      `curl -sfL '${FFMPEG_URL}' -o /tmp/ffmpeg.tar.xz && mkdir -p /tmp/ffmpeg-bin && tar xf /tmp/ffmpeg.tar.xz --strip-components=1 -C /tmp/ffmpeg-bin`,
-    ]);
+    await run(sandbox, 'sudo', ['dnf', 'install', '-y', 'ffmpeg-free']);
 
     // Step 2: Download the input media file
     await run(sandbox, 'bash', ['-c', `curl -sfL -o /tmp/input '${inputUrl}'`]);
@@ -67,7 +60,7 @@ export async function convertMedia(
     // Step 3: Collect input file metadata (so we can return it later)
     const { stdout: inputMetaJson } = await run(sandbox, 'bash', [
       '-c',
-      '/tmp/ffmpeg-bin/ffprobe -v error -show_entries format=duration,size,format_name -of json /tmp/input',
+      'ffprobe -v error -show_entries format=duration,size,format_name -of json /tmp/input',
     ]);
 
     // Step 4: Create the webhook and kick off ffmpeg in the background.
@@ -77,7 +70,6 @@ export async function convertMedia(
     const callbackUrl = new URL(webhook.url, baseUrl).href;
 
     const conversionScript = `#!/bin/bash
-export PATH="/tmp/ffmpeg-bin:$PATH"
 
 ffmpeg -i /tmp/input -y '/tmp/output.${outputFormat}' 2>/tmp/ffmpeg.log
 
