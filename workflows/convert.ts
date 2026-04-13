@@ -50,20 +50,27 @@ export async function convertMedia(
   });
 
   try {
-    // Step 1: Install ffmpeg via dnf (Amazon Linux 2023 package manager).
+    // Step 1: Install xz (needed to extract the ffmpeg tarball).
+    // The Sandbox is Amazon Linux 2023 with dnf + sudo available.
     // Each runCommand() is a durable step with visible stdout/stderr.
-    await run(sandbox, 'sudo', ['dnf', 'install', '-y', 'ffmpeg-free']);
+    await run(sandbox, 'sudo', ['dnf', 'install', '-y', 'xz']);
 
-    // Step 2: Download the input media file
+    // Step 2: Download and extract a static ffmpeg build from BtbN/FFmpeg-Builds.
+    await run(sandbox, 'bash', [
+      '-c',
+      "curl -sfL 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz' | tar xJf - --strip-components=1 -C /usr/local",
+    ]);
+
+    // Step 3: Download the input media file
     await run(sandbox, 'bash', ['-c', `curl -sfL -o /tmp/input '${inputUrl}'`]);
 
-    // Step 3: Collect input file metadata (so we can return it later)
+    // Step 4: Collect input file metadata (so we can return it later)
     const { stdout: inputMetaJson } = await run(sandbox, 'bash', [
       '-c',
       'ffprobe -v error -show_entries format=duration,size,format_name -of json /tmp/input',
     ]);
 
-    // Step 4: Create the webhook and kick off ffmpeg in the background.
+    // Step 5: Create the webhook and kick off ffmpeg in the background.
     // When ffmpeg finishes, the script curls the webhook URL to resume
     // the workflow. The workflow suspends (zero compute) while it runs.
     using webhook = createWebhook();
