@@ -27,7 +27,7 @@ export async function convertMedia(baseUrl: string, inputUrl: string, outputForm
     await run(sandbox, "bash", ["-c", `curl -sfL -o /tmp/input '${inputUrl}'`]);
 
     // Create webhook — the Sandbox will curl this URL when done
-    using webhook = createWebhook();
+    const webhook = createWebhook();
     const callbackUrl = new URL(webhook.url, baseUrl).href;
 
     // Write + start the conversion script in the background

@@ -74,7 +74,7 @@ export async function convertMedia(
     // Step 5: Create the webhook and kick off ffmpeg in the background.
     // When ffmpeg finishes, the script curls the webhook URL to resume
     // the workflow. The workflow suspends (zero compute) while it runs.
-    using webhook = createWebhook();
+    const webhook = createWebhook();
     const callbackUrl = new URL(webhook.url, baseUrl).href;
 
     const conversionScript = `#!/bin/bash
