@@ -50,15 +50,16 @@ export async function convertMedia(
   });
 
   try {
-    // Step 1: Install xz (needed to extract the ffmpeg tarball).
+    // Step 1: Install xz (needed to decompress the ffmpeg tarball).
     // The Sandbox is Amazon Linux 2023 with dnf + sudo available.
     // Each runCommand() is a durable step with visible stdout/stderr.
     await run(sandbox, 'sudo', ['dnf', 'install', '-y', 'xz']);
 
-    // Step 2: Download and extract a static ffmpeg build from BtbN/FFmpeg-Builds.
+    // Step 2: Download and extract a static ffmpeg build to /tmp
+    // (writable by the sandbox user — /usr/local requires root).
     await run(sandbox, 'bash', [
       '-c',
-      "curl -sfL 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz' | tar xJf - --strip-components=1 -C /usr/local",
+      "mkdir -p /tmp/ffmpeg && curl -sfL 'https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz' | tar xJf - --strip-components=1 -C /tmp/ffmpeg",
     ]);
 
     // Step 3: Download the input media file
@@ -67,7 +68,7 @@ export async function convertMedia(
     // Step 4: Collect input file metadata (so we can return it later)
     const { stdout: inputMetaJson } = await run(sandbox, 'bash', [
       '-c',
-      'ffprobe -v error -show_entries format=duration,size,format_name -of json /tmp/input',
+      '/tmp/ffmpeg/ffprobe -v error -show_entries format=duration,size,format_name -of json /tmp/input',
     ]);
 
     // Step 5: Create the webhook and kick off ffmpeg in the background.
@@ -78,10 +79,10 @@ export async function convertMedia(
 
     const conversionScript = `#!/bin/bash
 
-ffmpeg -i /tmp/input -y '/tmp/output.${outputFormat}' 2>/tmp/ffmpeg.log
+/tmp/ffmpeg/ffmpeg -i /tmp/input -y '/tmp/output.${outputFormat}' 2>/tmp/ffmpeg.log
 
 if [ $? -eq 0 ]; then
-  OUTPUT_META=$(ffprobe -v error -show_entries format=duration,size,format_name -of json '/tmp/output.${outputFormat}')
+  OUTPUT_META=$(/tmp/ffmpeg/ffprobe -v error -show_entries format=duration,size,format_name -of json '/tmp/output.${outputFormat}')
   curl -sf -X POST '${callbackUrl}' \\
     -H 'Content-Type: application/json' \\
     -d "{\\"output\\": $OUTPUT_META}"
