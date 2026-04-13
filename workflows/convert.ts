@@ -99,7 +99,7 @@ fi
     ]);
 
     // Start conversion in background — runCommand returns immediately
-    await run(sandbox, 'bash', ['-c', 'bash /home/user/convert.sh &']);
+    await run(sandbox, 'bash', ['-c', 'bash convert.sh &']);
 
     // Workflow SUSPENDS here — zero compute while ffmpeg runs
     // in the Sandbox. Could be seconds or minutes.
