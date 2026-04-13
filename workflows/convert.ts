@@ -77,8 +77,9 @@ curl -sf -X POST '${callbackUrl}' \\
       throw new Error('Conversion timed out after 5 minutes');
     }
 
-    // Parse the metadata that the script POSTed to the webhook
-    const metadata = await parseWebhookBody(result);
+    // Parse the metadata that the script POSTed to the webhook.
+    // Request#json() executes as a step in the workflow context.
+    const metadata = await result.json();
 
     return {
       outputFormat,
@@ -89,13 +90,4 @@ curl -sf -X POST '${callbackUrl}' \\
     // Always clean up the Sandbox VM
     await sandbox.stop();
   }
-}
-
-/**
- * Parse the webhook request body. This needs to be a step because
- * Request.json() is async and cannot run in the workflow sandbox.
- */
-async function parseWebhookBody(request: Request) {
-  'use step';
-  return await request.json();
 }
